@@ -274,6 +274,18 @@ class HidenCloudBot {
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
 const DEBUG_PORT = 9222;
 
+// 从 GitHub Secret PROXY 读取代理地址（支持 socks5://user:pass@host:port 或 http://host:port），
+// 转成 Chrome 的 --proxy-server 启动参数；未配置则返回空数组（走直连）。
+function getProxyArgs() {
+    const proxy = process.env.PROXY || process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
+    if (!proxy || !proxy.trim()) {
+        return [];
+    }
+    // 直接透传给 Chrome 的 --proxy-server，Chrome 原生支持 socks5:// 与 http:// 及 user:pass 认证
+    console.log('🌐 检测到代理配置，Chrome 将走代理。');
+    return [`--proxy-server=${proxy.trim()}`];
+}
+
 function checkPort(port) {
     return new Promise((resolve) => {
         const req = http.get(`http://localhost:${port}/json/version`, (res) => {
@@ -305,7 +317,8 @@ async function launchChrome() {
         '--disable-setuid-sandbox',
         '--disable-setuid-sandbox',
         `--user-data-dir=${userDataDir}`,
-        '--disable-dev-shm-usage'
+        '--disable-dev-shm-usage',
+        ...getProxyArgs(),
     ];
 
     const chrome = spawn(CHROME_PATH, args, {
@@ -440,7 +453,8 @@ async function sendFeishuNotification(summaryText) {
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 `--user-data-dir=${userDataDir}`,
-                '--disable-dev-shm-usage'
+                '--disable-dev-shm-usage',
+                ...getProxyArgs(),
             ];
 
             chromeProcess = spawn(CHROME_PATH, args, {

@@ -29,3 +29,11 @@ desktop.ini
 *.temp
 
 users.json
+
+# Python
+__pycache__/
+*.pyc
+config.json
+sing-box
+*.png
+screenshots/

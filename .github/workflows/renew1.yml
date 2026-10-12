@@ -2,42 +2,73 @@ name: Hidencloud Auto Renew New
 
 on:
   schedule:
+    # 每 3 天 UTC 10:00（北京时间 18:00）。到期即续，避免错过续期窗口。
     - cron: '0 10 */3 * *'
   workflow_dispatch:
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    
+    permissions:
+      actions: write
+      contents: read
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '20'
-          cache: 'npm'
-      
-      - name: Install Dependencies
+          python-version: '3.12'
+
+      - name: Install System & Python Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb
-          npm install
-          npx playwright install-deps chrome
-      
-      - name: Run Action Script
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
+          pip install seleniumbase requests
+          seleniumbase install chromedriver
+
+      - name: Start Proxy (sing-box)
+        continue-on-error: true
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          if [ -z "$PROXY_URL" ]; then
+            echo "PROXY_URL not set, skipping sing-box setup."
+            exit 0
+          fi
+          SINGBOX_VER="1.11.0"
+          echo "Downloading sing-box v${SINGBOX_VER}..."
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          tar -xzf "sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          mv "sing-box-${SINGBOX_VER}-linux-amd64/sing-box" ./sing-box
+          chmod +x ./sing-box
+          echo "Generating sing-box config from PROXY_URL..."
+          python proxy_handler.py
+          echo "Starting sing-box..."
+          nohup ./sing-box run -c config.json > singbox.log 2>&1 &
+          sleep 3
+          echo "sing-box started."
+
+      - name: Run Renew Script
         env:
           USERS_JSON: ${{ secrets.USERS_JSON }}
+          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          PROXY: ${{ secrets.PROXY }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action.js
-      
-      - name: Upload Screenshots (Debug)
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python3 app.py
+
+      - name: Upload Screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
+          name: screenshots
           path: ./*.png
+          if-no-files-found: ignore

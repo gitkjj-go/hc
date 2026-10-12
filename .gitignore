@@ -37,3 +37,6 @@ config.json
 sing-box
 *.png
 screenshots/
+
+# 调试产物
+.playwright-mcp/

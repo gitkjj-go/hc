@@ -48,8 +48,15 @@ jobs:
           python proxy_handler.py
           echo "Starting sing-box..."
           nohup ./sing-box run -c config.json > singbox.log 2>&1 &
-          sleep 3
-          echo "sing-box started."
+          for i in $(seq 1 10); do
+            if (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
+              echo "sing-box is listening on 127.0.0.1:8080"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "sing-box did not open 127.0.0.1:8080 in 10s; log follows:"
+          cat singbox.log
 
       - name: Run Renew Script
         env:

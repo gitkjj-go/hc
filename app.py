@@ -14,8 +14,9 @@
 import os
 import json
 import re
+import socket
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -32,7 +33,10 @@ FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK") or ""
 # 代理（仅登录阶段 SeleniumBase 使用；续期 requests 直接走直连）
 HTTP_PROXY_ENV = os.environ.get("HTTP_PROXY", "").strip() or os.environ.get("http_proxy", "").strip()
 PROXY_SERVER   = os.environ.get("PROXY_SERVER", "").strip()
-IS_PROXY       = os.environ.get("IS_PROXY", "false").lower() == "true"
+PROXY_URL      = os.environ.get("PROXY_URL", "").strip()
+
+# 有 PROXY_URL 时 workflow 会拉起本地 sing-box，浏览器走它的 HTTP inbound
+LOCAL_SINGBOX = "http://127.0.0.1:8080"
 
 CURRENT_EMAIL = ""
 
@@ -329,23 +333,27 @@ def login_and_get_session(sb, email, password):
     time.sleep(8)
 
     print("⏳ 等待 Cloudflare 验证自动通过...")
-    for _ in range(30):
+    for _ in range(60):
         if sb.is_element_present("input[type='password']"):
             print("✅ Cloudflare 验证通过，登录表单已出现")
             break
         time.sleep(1)
+    else:
+        print(f"❌ 60s 内未出现登录表单，当前 URL: {sb.get_current_url()}")
+        sb.save_screenshot("login_no_form.png")
+        return None, None
 
-    # 定位输入框：HidenCloud 用 "Email or Username"（非标准 email input）
-    try:
-        sb.wait_for_element_visible("input[type='email']", timeout=10)
-        email_sel = "input[type='email']"
-    except Exception:
-        try:
-            sb.wait_for_element_visible("input[placeholder*='email' i]", timeout=10)
-            email_sel = "input[placeholder*='email' i]"
-        except Exception:
-            # 兜底：第一个 textbox 当作用户名
-            email_sel = "input:not([type='password'])"
+    # 定位输入框：HidenCloud 用 name="username"（placeholder "Enter your email or username"）
+    email_sel = ""
+    for sel in ("#username", "input[name='username']",
+                "input[placeholder*='email' i]", "input[type='email']"):
+        if sb.is_element_present(sel):
+            email_sel = sel
+            break
+    if not email_sel:
+        print("❌ 未找到用户名输入框")
+        sb.save_screenshot("login_no_form.png")
+        return None, None
 
     print("📧 填写邮箱...")
     sb.type(email_sel, email)
@@ -354,6 +362,21 @@ def login_and_get_session(sb, email, password):
     print("🔑 填写密码...")
     sb.type("input[type='password']", password)
     time.sleep(2)
+
+    # 表单里的 cf-turnstile-response 必须由 Turnstile 自动填充，否则提交必然被拒
+    print("⏳ 等待 Turnstile token 生成...")
+    token_ready = False
+    for _ in range(30):
+        val = sb.execute_script(
+            "return (document.querySelector('input[name=\"cf-turnstile-response\"]') || {}).value || '';"
+        )
+        if val:
+            print(f"✅ Turnstile token 已生成 ({len(val)} 字符)")
+            token_ready = True
+            break
+        time.sleep(1)
+    if not token_ready:
+        print("⚠️ Turnstile token 未生成，仍尝试提交（大概率会被拒）")
 
     print("🖱️ 点击登录...")
     try:
@@ -384,19 +407,37 @@ def login_and_get_session(sb, email, password):
 
 
 # ============ 主入口 ============
+def _wait_port(host: str, port: int, timeout: float = 10.0) -> bool:
+    """等待本地端口可连（sing-box 是 nohup 后台起的，就绪时间不确定）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
 def main():
     print("#" * 30)
     print("   HidenCloud 自动登录续期 (UC 过盾 + HTTP 续期)")
     print("#" * 30)
 
-    proxy_str = HTTP_PROXY_ENV or PROXY_SERVER or "http://127.0.0.1:8080"
+    # 优先级：显式 HTTP_PROXY/PROXY_SERVER > PROXY_URL(workflow 已拉起本地 sing-box) > 直连
+    proxy_str = HTTP_PROXY_ENV or PROXY_SERVER
+    if not proxy_str and PROXY_URL:
+        if _wait_port("127.0.0.1", 8080):
+            proxy_str = LOCAL_SINGBOX
+        else:
+            print("⚠️ 已配置 PROXY_URL 但本地 sing-box (127.0.0.1:8080) 未就绪，回退直连")
+
     sb_kwargs = {"uc": True, "headless": False}
-    if IS_PROXY or HTTP_PROXY_ENV or PROXY_SERVER:
+    if proxy_str:
         print(f"🔗 挂载代理: {proxy_str}")
         sb_kwargs["proxy"] = proxy_str
     else:
-        print(f"🌐 未显式配置代理，默认走本地 sing-box(127.0.0.1:8080)")
-        sb_kwargs["proxy"] = proxy_str
+        print("🌐 未配置代理，浏览器走直连")
 
     accounts = load_accounts()
     if not accounts:
@@ -424,7 +465,12 @@ def main():
             except Exception:
                 pass
 
-            cookies, csrf = login_and_get_session(sb, acct["email"], acct["password"])
+            try:
+                cookies, csrf = login_and_get_session(sb, acct["email"], acct["password"])
+            except Exception as e:
+                print(f"❌ 登录过程异常: {e}")
+                sb.save_screenshot("login_error.png")
+                cookies, csrf = None, None
             if cookies is None:
                 notify("❌", "登录失败", "Cloudflare 验证未通过或账号密码错误")
                 continue

@@ -16,51 +16,6 @@ const os = require('os');
 chromium.use(stealth);
 
 const RENEW_DAYS = 10;
-const INJECTED_SCRIPT = `
-(function() {
-    if (window.self === window.top) return;
-
-    try {
-        function getRandomInt(min, max) {
-            return Math.floor(Math.random() * (max - min + 1)) + min;
-        }
-        let screenX = getRandomInt(800, 1200);
-        let screenY = getRandomInt(400, 600);
-        
-        Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
-        Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
-    } catch (e) { }
-
-    try {
-        const originalAttachShadow = Element.prototype.attachShadow;
-        Element.prototype.attachShadow = function(init) {
-            const shadowRoot = originalAttachShadow.call(this, init);
-            if (shadowRoot) {
-                const checkAndReport = () => {
-                    const checkbox = shadowRoot.querySelector('input[type="checkbox"]');
-                    if (checkbox) {
-                        const rect = checkbox.getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0 && window.innerWidth > 0 && window.innerHeight > 0) {
-                            const xRatio = (rect.left + rect.width / 2) / window.innerWidth;
-                            const yRatio = (rect.top + rect.height / 2) / window.innerHeight;
-                            window.__turnstile_data = { xRatio, yRatio };
-                            return true;
-                        }
-                    }
-                    return false;
-                };
-                if (!checkAndReport()) {
-                    const observer = new MutationObserver(() => {
-                        if (checkAndReport()) observer.disconnect();
-                    });
-                    observer.observe(shadowRoot, { childList: true, subtree: true });
-                }
-            }
-            return shadowRoot;
-        };
-    } catch (e) { }
-})();
-`;
 
 // Helper to sleep
 const sleep = (min = 3000, max = 8000) => {
@@ -371,58 +326,19 @@ async function launchChrome() {
 }
 
 
-async function attemptTurnstileCdp(page) {
-    const frames = page.frames();
-    for (const frame of frames) {
-        try {
-            const data = await frame.evaluate(() => window.__turnstile_data).catch(() => null);
-
-            if (data) {
-                console.log('>> 在框架中发现 Turnstile。比例:', data);
-                const iframeElement = await frame.frameElement();
-                if (!iframeElement) continue;
-
-                const box = await iframeElement.boundingBox();
-                if (!box) continue;
-
-                const clickX = box.x + (box.width * data.xRatio);
-                const clickY = box.y + (box.height * data.yRatio);
-
-                const client = await page.context().newCDPSession(page);
-                await client.send('Input.dispatchMouseEvent', {
-                    type: 'mousePressed',
-                    x: clickX,
-                    y: clickY,
-                    button: 'left',
-                    clickCount: 1
-                });
-                await new Promise(r => setTimeout(r, 50 + Math.random() * 100));
-                await client.send('Input.dispatchMouseEvent', {
-                    type: 'mouseReleased',
-                    x: clickX,
-                    y: clickY,
-                    button: 'left',
-                    clickCount: 1
-                });
-                console.log('>> CDP 点击已发送。');
-                await client.detach();
-                return true;
-            }
-        } catch (e) { }
-    }
-    return false;
-}
-
 async function handleVerification(page) {
-    console.log('正在检查验证...');
-    for (let i = 0; i < 30; i++) {
+    // Cloudflare Turnstile 为「managed」非交互型：会在后台自动完成浏览器指纹检测，
+    // 无需（也不应）主动点击勾选框。点击反而暴露 CDP 自动化特征，导致验证卡住。
+    // 因此这里只耐心等待挑战自动放行，直到登录表单出现。
+    console.log('正在等待 Cloudflare 挑战自动通过 (managed, 非交互)...');
+    for (let i = 0; i < 60; i++) {
         if (await page.getByRole('textbox', { name: 'Email or Username' }).isVisible()) {
             console.log('检测到登录表单。');
             return;
         }
-        await attemptTurnstileCdp(page);
         await page.waitForTimeout(1000);
     }
+    console.log('⚠️ 等待登录表单超时，Cloudflare 挑战可能未通过。');
 }
 
 // ==========================================
@@ -551,7 +467,6 @@ async function sendFeishuNotification(summaryText) {
             const defaultContext = browser.contexts()[0];
             page = await defaultContext.newPage();
 
-            await page.addInitScript(INJECTED_SCRIPT);
             page.setDefaultTimeout(60000);
 
             let loginSuccess = false;
@@ -565,12 +480,6 @@ async function sendFeishuNotification(summaryText) {
             await page.getByRole('textbox', { name: 'Email or Username' }).fill(user.username);
             await page.getByRole('textbox', { name: 'Password' }).click();
             await page.getByRole('textbox', { name: 'Password' }).fill(user.password);
-
-            console.log('正在检查二次验证...');
-            for (let j = 0; j < 5; j++) {
-                if (await attemptTurnstileCdp(page)) await page.waitForTimeout(2000);
-                await page.waitForTimeout(500);
-            }
 
             console.log('正在点击登录...');
             await page.getByRole('button', { name: 'Sign in to your account' }).click();

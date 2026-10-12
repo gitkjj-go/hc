@@ -15,8 +15,10 @@ import os
 import json
 import re
 import time
+from urllib.parse import urljoin, urlparse
 
 import requests
+from bs4 import BeautifulSoup
 
 BASE_URL = "https://dash.hidencloud.com"
 RENEW_DAYS = 10
@@ -147,34 +149,41 @@ class HidenCloudClient:
         self.session.headers.update(self.COMMON_HEADERS)
         self.session.cookies.update(cookies)
 
-    def get(self, url):
-        return self.session.get(BASE_URL + url, timeout=30)
+    def _full(self, url: str) -> str:
+        """绝对 URL 直接返回；相对路径拼到 BASE_URL。"""
+        if url.startswith("http"):
+            return url
+        return urljoin(BASE_URL, url)
 
-    def post(self, url, data, headers=None):
+    def get(self, url):
+        return self.session.get(self._full(url), timeout=30)
+
+    def post(self, url, data, headers=None, allow_redirects=True):
         h = {"X-CSRF-TOKEN": self.csrf}
         if headers:
             h.update(headers)
-        return self.session.post(BASE_URL + url, data=data, headers=h, timeout=30)
+        return self.session.post(self._full(url), data=data, headers=h, timeout=30,
+                                 allow_redirects=allow_redirects)
 
 
 def _extract_meta_csrf(html: str) -> str:
-    m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)', html)
-    if not m:
-        m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']csrf-token["\']', html)
-    return m.group(1) if m else ""
+    soup = BeautifulSoup(html, "html.parser")
+    meta = soup.find("meta", {"name": "csrf-token"})
+    return meta.get("content", "") if meta else ""
 
 
 def _extract_form_token(html: str) -> str:
-    m = re.search(r'<input[^>]+name=["\']_token["\'][^>]+value=["\']([^"\']+)', html)
-    if not m:
-        m = re.search(r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']_token["\'][^>]*>', html)
-    return m.group(1) if m else ""
+    soup = BeautifulSoup(html, "html.parser")
+    inp = soup.find("input", {"name": "_token"})
+    return inp.get("value", "") if inp else ""
 
 
 def _extract_service_ids(html: str):
     """复刻 $('a[href*="/service/"]') 匹配 /service/{id}/manage 去重。"""
+    soup = BeautifulSoup(html, "html.parser")
     ids = []
-    for href in re.findall(r'href=["\']([^"\']*\/service\/[^"\']*)["\']', html):
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
         m = re.search(r'/service/(\d+)/manage', href)
         if m and m.group(1) not in ids:
             ids.append(m.group(1))
@@ -183,9 +192,11 @@ def _extract_service_ids(html: str):
 
 def _extract_invoice_links(html: str):
     """复刻 checkAndPayInvoices: 找 /invoice/ 链接，排除 download。"""
+    soup = BeautifulSoup(html, "html.parser")
     links = []
-    for href in re.findall(r'href=["\']([^"\']*\/invoice\/[^"\']*)["\']', html):
-        if href and "download" not in href and href not in links:
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/invoice/" in href and "download" not in href and href not in links:
             links.append(href)
     return links
 
@@ -195,22 +206,28 @@ def _find_pay_form(html: str):
 
     inputs: [(name, value), ...]。action 不能含 balance/add。
     """
-    # 逐个 form 块匹配
-    for form_block in re.findall(r'<form[^>]*>.*?</form>', html, re.S | re.I):
-        action_m = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', form_block, re.I)
-        if not action_m:
+    soup = BeautifulSoup(html, "html.parser")
+    for form in soup.find_all("form", action=True):
+        action = form.get("action", "")
+        if not action or "balance/add" in action:
             continue
-        action = action_m.group(1)
-        # 找 button 文本
-        btn_m = re.search(r'<button[^>]*>(.*?)</button>', form_block, re.S | re.I)
-        btn_text = re.sub(r'<[^>]+>', '', btn_m.group(1) if btn_m else '').strip().lower()
-        if "pay" in btn_text and action and "balance/add" not in action:
-            inputs = []
-            for m in re.finditer(r'<input[^>]+name=["\']([^"\']+)["\'][^>]*>', form_block, re.I):
-                name = m.group(1)
-                val_m = re.search(r'value=["\']([^"\']*)["\']', m.group(0), re.I)
-                inputs.append((name, val_m.group(1) if val_m else ""))
-            return action, inputs
+        # 按钮文本（含 submit button 或 input[type=submit]）
+        btn_text = ""
+        for btn in form.find_all(["button", "input"]):
+            if btn.name == "input" and btn.get("type", "").lower() != "submit":
+                continue
+            t = (btn.get("value") or btn.get_text() or "").strip().lower()
+            if t:
+                btn_text = t
+                break
+        if "pay" not in btn_text:
+            continue
+        inputs = []
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if name:
+                inputs.append((name, inp.get("value", "") or ""))
+        return action, inputs
     return None, []
 
 
@@ -223,16 +240,25 @@ def process_service(client, sid):
 
         print(f"📅 提交续期 ({RENEW_DAYS} 天)...")
         data = {"_token": form_token, "days": str(RENEW_DAYS)}
+        # 原 JS 用 maxRedirects:0，靠响应头 Location 判断跳转；这里 allow_redirects=False 对齐
         resp = client.post(
             f"/service/{sid}/renew",
             data,
             {"Referer": f"{BASE_URL}/service/{sid}/manage"},
+            allow_redirects=False,
         )
 
-        final_url = resp.url
+        location = resp.headers.get("Location", "")
+        final_url = location or resp.url
         if "/invoice/" in final_url:
             print("⚡️ 续期成功，前往支付")
-            perform_pay_from_html(client, resp.text, final_url)
+            # 原 JS 对 302 会递归 request('GET', location) 拿 invoice 页 HTML，
+            # 再解析支付表单。这里显式 GET 一遍再解析。
+            try:
+                inv_resp = client.get(final_url)
+                perform_pay_from_html(client, inv_resp.text, inv_resp.url)
+            except Exception as e:
+                print(f"⚠️ 打开 invoice 页失败: {e}")
         else:
             print("⚠️ 续期后未跳转，检查账单列表...")
             check_and_pay_invoices(client, sid)

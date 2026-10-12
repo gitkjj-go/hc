@@ -26,7 +26,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
-          pip install seleniumbase requests
+          pip install seleniumbase requests beautifulsoup4
           seleniumbase install chromedriver
 
       - name: Start Proxy (sing-box)

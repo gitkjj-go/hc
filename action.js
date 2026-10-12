@@ -452,6 +452,36 @@ async function sendTelegramNotification(summaryText) {
     }
 }
 
+// 发送飞书群机器人消息（关键词校验模式）
+async function sendFeishuNotification(summaryText) {
+    const webhook = process.env.FEISHU_WEBHOOK;
+
+    if (!webhook) {
+        console.log('⚠️ 未检测到 FEISHU_WEBHOOK，跳过飞书通知。');
+        return;
+    }
+
+    console.log('📨 正在发送飞书通知...');
+    try {
+        // 飞书富文本消息，标题带「定时任务」关键词以满足机器人安全校验
+        await axios.post(webhook, {
+            msg_type: 'interactive',
+            card: {
+                header: {
+                    title: { tag: 'plain_text', content: '定时任务 · HidenCloud 续期报告' },
+                    template: 'blue'
+                },
+                elements: [
+                    { tag: 'div', text: { tag: 'lark_md', content: summaryText } }
+                ]
+            }
+        });
+        console.log('✅ 飞书通知发送成功');
+    } catch (e) {
+        console.error('❌ 飞书通知发送失败:', e.message);
+    }
+}
+
 (async () => {
     const users = getUsers();
     if (users.length === 0) {
@@ -604,7 +634,7 @@ async function sendTelegramNotification(summaryText) {
     console.log('\n\n╔════════════════════════════════════════════╗');
     console.log('║               Final Summary                ║');
     console.log('╚════════════════════════════════════════════╝');
-    let summaryText = `*HidenCloud 续期任务报告 (${new Date().toLocaleDateString()})*\n\n`;
+    let summaryText = `**HidenCloud 续期任务报告 (${new Date().toLocaleDateString()})**\n\n`;
 
     summary.forEach(s => {
         const line = `User: ${s.user} | Status: ${s.status} | Services: ${s.services}`;
@@ -613,6 +643,7 @@ async function sendTelegramNotification(summaryText) {
     });
 
     await sendTelegramNotification(summaryText);
+    await sendFeishuNotification(summaryText);
 
     // Exit code based on success
     if (summary.some(s => s.status.includes('Failed'))) {

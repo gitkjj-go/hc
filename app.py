@@ -63,6 +63,11 @@ def requests_proxy_mapping(proxy: str | None) -> dict:
     return {"http": proxy, "https": proxy} if proxy else {}
 
 
+def should_attempt_uc_challenge(state: dict, attempts: int) -> bool:
+    """Return whether an unresolved Cloudflare challenge may be retried."""
+    return bool(state.get("cloudflare_challenge")) and attempts < 3
+
+
 # ============ 账户加载 ============
 def load_accounts():
     accounts = []
@@ -393,8 +398,7 @@ def login_and_get_session(sb, email, password):
         if last_state["login_form"]:
             print("✅ Cloudflare 验证通过，登录表单已出现")
             break
-        if (last_state["cloudflare_challenge"]
-                and challenge_attempts < 3
+        if (should_attempt_uc_challenge(last_state, challenge_attempts)
                 and second in (5, 20, 35)):
             challenge_attempts += 1
             _try_uc_challenge(sb, challenge_attempts)
@@ -427,7 +431,8 @@ def login_and_get_session(sb, email, password):
     # 表单里的 cf-turnstile-response 必须由 Turnstile 自动填充，否则提交必然被拒
     print("⏳ 等待 Turnstile token 生成...")
     token_ready = False
-    for _ in range(30):
+    turnstile_attempts = 0
+    for second in range(30):
         val = sb.execute_script(
             "return (document.querySelector('input[name=\"cf-turnstile-response\"]') || {}).value || '';"
         )
@@ -435,9 +440,21 @@ def login_and_get_session(sb, email, password):
             print(f"✅ Turnstile token 已生成 ({len(val)} 字符)")
             token_ready = True
             break
+        try:
+            turnstile_state = describe_login_page(sb.get_page_source())
+        except Exception:
+            turnstile_state = describe_login_page("")
+        if (should_attempt_uc_challenge(turnstile_state, turnstile_attempts)
+                and second in (3, 12, 21)):
+            turnstile_attempts += 1
+            _try_uc_challenge(sb, turnstile_attempts)
         time.sleep(1)
     if not token_ready:
-        print("⚠️ Turnstile token 未生成，仍尝试提交（大概率会被拒）")
+        if turnstile_state["turnstile_present"]:
+            print("❌ Turnstile token 未生成，取消提交以避免必然失败")
+            _save_login_diagnostics(sb, "turnstile_no_token", turnstile_state)
+            return None, None
+        print("ℹ️ 页面未检测到 Turnstile，继续提交登录表单")
 
     print("🖱️ 点击登录...")
     try:

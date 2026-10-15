@@ -68,6 +68,21 @@ def should_attempt_uc_challenge(state: dict, attempts: int) -> bool:
     return bool(state.get("cloudflare_challenge")) and attempts < 3
 
 
+def extract_cookie_values(cookies) -> dict:
+    """Normalize Selenium cookie objects and dictionary cookies for requests."""
+    values = {}
+    for cookie in cookies or []:
+        if isinstance(cookie, dict):
+            name = cookie.get("name")
+            value = cookie.get("value")
+        else:
+            name = getattr(cookie, "name", None)
+            value = getattr(cookie, "value", None)
+        if name is not None and value is not None:
+            values[str(name)] = str(value)
+    return values
+
+
 # ============ 账户加载 ============
 def load_accounts():
     accounts = []
@@ -222,6 +237,18 @@ def _extract_service_ids(html: str):
     return ids
 
 
+def initialize_http_session_from_dashboard(response):
+    """Validate the requests session and derive fresh dashboard state."""
+    final_url = (getattr(response, "url", "") or "").lower()
+    if "/auth/login" in final_url or "/login" in final_url:
+        return None
+    html = getattr(response, "text", "") or ""
+    return {
+        "csrf": _extract_meta_csrf(html),
+        "service_ids": _extract_service_ids(html),
+    }
+
+
 def _extract_invoice_links(html: str):
     """复刻 checkAndPayInvoices: 找 /invoice/ 链接，排除 download。"""
     soup = BeautifulSoup(html, "html.parser")
@@ -269,6 +296,12 @@ def process_service(client, sid):
     try:
         resp = client.get(f"/service/{sid}/manage")
         form_token = _extract_form_token(resp.text)
+        if not form_token:
+            print(
+                "❌ 服务管理页未找到 _token，取消续期："
+                f"status={resp.status_code}, url={resp.url}"
+            )
+            return
 
         print(f"📅 提交续期 ({RENEW_DAYS} 天)...")
         data = {"_token": form_token, "days": str(RENEW_DAYS)}
@@ -472,7 +505,7 @@ def login_and_get_session(sb, email, password):
         if "/dashboard" in cur:
             print(f"✅ 登录成功！(URL: {sb.get_current_url()})")
             # 取 cookie 与 csrf
-            cookies = {c["name"]: c["value"] for c in sb.get_all_cookies()}
+            cookies = extract_cookie_values(sb.get_all_cookies())
             html = sb.get_page_source()
             csrf = _extract_meta_csrf(html)
             if not csrf:
@@ -553,24 +586,34 @@ def main():
                 notify("❌", "登录失败", "Cloudflare 验证未通过或账号密码错误")
                 continue
 
-            # 登录成功 → 用 cookies + csrf 跑纯 HTTP 续期
-            html = sb.get_page_source()
-            service_ids = _extract_service_ids(html)
-            if not service_ids:
-                # dashboard 可能需要再请求一次
-                client = HidenCloudClient(cookies, csrf, proxy_str)
-                try:
-                    dash = client.get("/dashboard")
-                    service_ids = _extract_service_ids(dash.text)
-                except Exception as e:
-                    print(f"⚠️ 重新请求 dashboard 失败: {e}")
+            # 浏览器登录成功后，必须用同一代理验证 HTTP 会话并刷新页面 CSRF。
+            client = HidenCloudClient(cookies, csrf, proxy_str)
+            try:
+                dash = client.get("/dashboard")
+                http_state = initialize_http_session_from_dashboard(dash)
+            except Exception as e:
+                print(f"❌ HTTP dashboard 会话验证失败: {e}")
+                notify("❌", "HTTP 会话验证失败", str(e))
+                continue
+
+            if http_state is None:
+                print(f"❌ HTTP 会话未保持登录: status={dash.status_code}, url={dash.url}")
+                notify("❌", "HTTP 会话未保持登录", f"status={dash.status_code}")
+                continue
+
+            csrf = http_state["csrf"] or csrf
+            client.csrf = csrf
+            service_ids = http_state["service_ids"]
+            print(
+                f"✅ HTTP 会话验证成功: status={dash.status_code}, "
+                f"发现 {len(service_ids)} 个服务"
+            )
 
             if not service_ids:
                 print("ℹ️ 未发现服务")
                 notify("ℹ️", "未发现可续期服务", "dashboard 未匹配到服务链接")
                 continue
 
-            client = HidenCloudClient(cookies, csrf, proxy_str)
             renew_all(client, service_ids)
             notify("✅", "续期流程已执行", f"共 {len(service_ids)} 个服务")
 

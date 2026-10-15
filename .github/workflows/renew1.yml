@@ -2,8 +2,8 @@ name: Hidencloud Auto Renew New
 
 on:
   schedule:
-    # 每 3 天 UTC 10:00（北京时间 18:00）。到期即续，避免错过续期窗口。
-    - cron: '0 10 */3 * *'
+    # 每 6 小时检查一次，覆盖免费服务到期前不足 1 天的续期窗口。
+    - cron: '17 */6 * * *'
   workflow_dispatch:
 
 jobs:
@@ -57,6 +57,9 @@ jobs:
           done
           echo "sing-box did not open 127.0.0.1:8080 in 10s; log follows:"
           cat singbox.log
+
+      - name: Run Regression Tests
+        run: python -m unittest discover -v
 
       - name: Run Renew Script
         env:

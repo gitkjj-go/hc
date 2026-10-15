@@ -6,6 +6,8 @@
 
 这是一个用于 HidenCloud 服务自动续期的脚本，支持本地运行、GitHub Actions 云端运行和青龙面板三种部署方式。可以自动完成续期和支付操作，并智能管理 Cookie 缓存。
 
+当前 `renew1.yml` 工作流运行 Python 的 `app.py`：UC 登录后继续在同一个浏览器中续期，避免复制 Cookie 到 requests 后被返回 403。续期规则和诊断见 [浏览器续期说明](docs/hidencloud-browser-renewal.md)。下文的 Node.js/Cookie 缓存说明适用于保留的旧脚本。
+
 ## ✨ 主要特性
 
 - ☁️ **多种部署方式**：本地运行 / GitHub Actions / 青龙面板

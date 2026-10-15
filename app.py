@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""HidenCloud 自动登录续期（SeleniumBase UC 过盾 + 纯 HTTP 续期）
+"""HidenCloud 自动登录续期（SeleniumBase UC 登录 + 浏览器内续期）
 
 架构：
   1. 登录/过盾：SeleniumBase UC 模式（可过 Cloudflare Turnstile），登录成功后
-     从浏览器取出 Cookie 与 CSRF token。
-  2. 续期/支付：用 requests 纯 HTTP 忠实复刻原 local_renew.js 的核心逻辑
-     （processService / checkAndPayInvoices / performPayFromHtml）。
+     保留已认证的浏览器会话。
+  2. 续期/支付：沿用浏览器原生表单、页面允许周期与独立验证码。
+     旧 HTTP 客户端保留供兼容，但主入口不再切换 requests 会话。
 
 依赖: seleniumbase, requests
 """
@@ -16,10 +16,13 @@ import json
 import re
 import socket
 import time
+from types import SimpleNamespace
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+
+from browser_renew import renew_service
 
 BASE_URL = "https://dash.hidencloud.com"
 RENEW_DAYS = 10
@@ -30,7 +33,7 @@ TG_CHAT_ID     = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN   = os.environ.get("TG_BOT_TOKEN") or ""
 FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK") or ""
 
-# 代理（仅登录阶段 SeleniumBase 使用；续期 requests 直接走直连）
+# 登录与续期复用同一 SeleniumBase 浏览器和代理。
 HTTP_PROXY_ENV = os.environ.get("HTTP_PROXY", "").strip() or os.environ.get("http_proxy", "").strip()
 PROXY_SERVER   = os.environ.get("PROXY_SERVER", "").strip()
 PROXY_URL      = os.environ.get("PROXY_URL", "").strip()
@@ -243,6 +246,13 @@ def initialize_http_session_from_dashboard(response):
     if "/auth/login" in final_url or "/login" in final_url:
         return None
     html = getattr(response, "text", "") or ""
+    if not 200 <= getattr(response, 'status_code', 200) < 300:
+        return None
+    soup = BeautifulSoup(html, 'html.parser')
+    title = soup.title.get_text().lower() if soup.title else ''
+    if (any(marker in title for marker in ('just a moment', 'security verification', 'attention required'))
+            or soup.select_one('input[type="password"], #challenge-form')):
+        return None
     return {
         "csrf": _extract_meta_csrf(html),
         "service_ids": _extract_service_ids(html),
@@ -530,9 +540,41 @@ def _wait_port(host: str, port: int, timeout: float = 10.0) -> bool:
     return False
 
 
+def renew_browser_services(sb):
+    """Discover even collapsed service links and preserve the browser session."""
+    page = SimpleNamespace(url=sb.get_current_url(), text=sb.get_page_source(), status_code=200)
+    state = initialize_http_session_from_dashboard(page)
+    if state is None:
+        print('❌ 浏览器 dashboard 未保持登录或仍在安全验证页')
+        notify('❌', '浏览器会话验证失败')
+        sb.save_screenshot('renew_dashboard_failed.png')
+        return False
+    ids = state['service_ids']
+    print(f'🔎 浏览器发现 {len(ids)} 个服务: {ids}')
+    if not ids:
+        notify('ℹ️', '未发现服务', '已检查 dashboard HTML（包括折叠区域）')
+        return True
+    results = []
+    for sid in ids:
+        try:
+            result = renew_service(sb, sid)
+        except Exception as exc:
+            result = {'status': 'failed', 'detail': f'浏览器续期异常: {type(exc).__name__}'}
+        results.append(result['status'])
+        print(f'[{sid}] {result["status"]}: {result["detail"]}')
+        icons = {'paid': '✅', 'skipped': '⏳', 'failed': '❌'}
+        notify(icons[result['status']], f'服务 {sid}: {result["detail"]}')
+        if result['status'] == 'failed':
+            try:
+                sb.save_screenshot(f'renew_failed_{sid}.png')
+            except Exception:
+                print('⚠️ 未能保存续期失败截图')
+    return 'failed' not in results
+
+
 def main():
     print("#" * 30)
-    print("   HidenCloud 自动登录续期 (UC 过盾 + HTTP 续期)")
+    print("   HidenCloud 自动登录续期 (UC 登录 + 浏览器表单续期)")
     print("#" * 30)
 
     # 优先级：显式 HTTP_PROXY/PROXY_SERVER > PROXY_URL(workflow 已拉起本地 sing-box) > 直连
@@ -556,6 +598,7 @@ def main():
         return
 
     print(f"📋 共 {len(accounts)} 个账号待续期")
+    failed = False
     for idx, acct in enumerate(accounts, 1):
         global CURRENT_EMAIL
         CURRENT_EMAIL = acct["email"]
@@ -567,6 +610,7 @@ def main():
             from seleniumbase import SB
         except ImportError:
             print("❌ seleniumbase 未安装, 请先 pip install seleniumbase")
+            failed = True
             continue
 
         with SB(**sb_kwargs) as sb:
@@ -584,38 +628,13 @@ def main():
                 cookies, csrf = None, None
             if cookies is None:
                 notify("❌", "登录失败", "Cloudflare 验证未通过或账号密码错误")
+                failed = True
                 continue
 
-            # 浏览器登录成功后，必须用同一代理验证 HTTP 会话并刷新页面 CSRF。
-            client = HidenCloudClient(cookies, csrf, proxy_str)
-            try:
-                dash = client.get("/dashboard")
-                http_state = initialize_http_session_from_dashboard(dash)
-            except Exception as e:
-                print(f"❌ HTTP dashboard 会话验证失败: {e}")
-                notify("❌", "HTTP 会话验证失败", str(e))
-                continue
-
-            if http_state is None:
-                print(f"❌ HTTP 会话未保持登录: status={dash.status_code}, url={dash.url}")
-                notify("❌", "HTTP 会话未保持登录", f"status={dash.status_code}")
-                continue
-
-            csrf = http_state["csrf"] or csrf
-            client.csrf = csrf
-            service_ids = http_state["service_ids"]
-            print(
-                f"✅ HTTP 会话验证成功: status={dash.status_code}, "
-                f"发现 {len(service_ids)} 个服务"
-            )
-
-            if not service_ids:
-                print("ℹ️ 未发现服务")
-                notify("ℹ️", "未发现可续期服务", "dashboard 未匹配到服务链接")
-                continue
-
-            renew_all(client, service_ids)
-            notify("✅", "续期流程已执行", f"共 {len(service_ids)} 个服务")
+            # 与旧 action.js 一样保留浏览器会话，避免转 requests 后出现 403。
+            if not renew_browser_services(sb):
+                failed = True
+    return 1 if failed else 0
 
 
 def _random_delay():
@@ -632,4 +651,4 @@ def _random_delay():
 
 if __name__ == "__main__":
     _random_delay()
-    main()
+    raise SystemExit(main())

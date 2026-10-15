@@ -41,6 +41,28 @@ LOCAL_SINGBOX = "http://127.0.0.1:8080"
 CURRENT_EMAIL = ""
 
 
+def describe_login_page(html: str) -> dict:
+    """Return non-sensitive markers used to distinguish login and CF pages."""
+    source = (html or "").lower()
+    has_username = bool(re.search(r'<input[^>]+name=[\"\']username[\"\']', source))
+    has_password = bool(re.search(r'<input[^>]+type=[\"\']password[\"\']', source))
+    has_challenge = (
+        "challenges.cloudflare.com" in source
+        or "cf-chl-" in source
+        or "just a moment" in source
+    )
+    return {
+        "login_form": has_username and has_password,
+        "cloudflare_challenge": has_challenge,
+        "turnstile_present": "cf-turnstile-response" in source,
+    }
+
+
+def requests_proxy_mapping(proxy: str | None) -> dict:
+    """Create requests' proxy configuration from SeleniumBase's proxy value."""
+    return {"http": proxy, "https": proxy} if proxy else {}
+
+
 # ============ 账户加载 ============
 def load_accounts():
     accounts = []
@@ -146,12 +168,13 @@ class HidenCloudClient:
         "Referer": BASE_URL + "/",
     }
 
-    def __init__(self, cookies: dict, csrf: str):
+    def __init__(self, cookies: dict, csrf: str, proxy: str | None = None):
         self.cookies = cookies
         self.csrf = csrf
         self.session = requests.Session()
         self.session.headers.update(self.COMMON_HEADERS)
         self.session.cookies.update(cookies)
+        self.session.proxies.update(requests_proxy_mapping(proxy))
 
     def _full(self, url: str) -> str:
         """绝对 URL 直接返回；相对路径拼到 BASE_URL。"""
@@ -326,21 +349,59 @@ def renew_all(client, service_ids):
 
 
 # ============ 登录（SeleniumBase UC 过盾） ============
+def _save_login_diagnostics(sb, stage: str, state: dict) -> None:
+    """Save failure evidence without exposing credentials, cookies, or tokens."""
+    safe_email = re.sub(r"[^a-zA-Z0-9_.-]+", "_", CURRENT_EMAIL.split("@", 1)[0])[:32] or "account"
+    filename = f"login_{stage}_{safe_email}.png"
+    try:
+        print(
+            "ℹ️ 登录页诊断: "
+            f"url={sb.get_current_url()}, title={sb.get_title() or ''}, "
+            f"login_form={state['login_form']}, "
+            f"cloudflare_challenge={state['cloudflare_challenge']}, "
+            f"turnstile_present={state['turnstile_present']}"
+        )
+        sb.save_screenshot(filename)
+        print(f"📸 已保存登录失败截图: {filename}")
+    except Exception as exc:
+        print(f"⚠️ 保存登录诊断失败: {exc}")
+
+
+def _try_uc_challenge(sb, attempt: int) -> None:
+    """Give SeleniumBase UC one bounded opportunity to interact with CF."""
+    print(f"🖱️ 检测到 Cloudflare 挑战，尝试 UC 验证 ({attempt}/3)...")
+    try:
+        sb.uc_gui_click_captcha()
+    except Exception as exc:
+        print(f"⚠️ UC 验证操作未完成: {exc}")
+
+
 def login_and_get_session(sb, email, password):
     """UC 过盾登录，成功后返回 (cookies_dict, csrf_token) 或 (None, None)。"""
     print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
     sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
     time.sleep(8)
 
-    print("⏳ 等待 Cloudflare 验证自动通过...")
-    for _ in range(60):
-        if sb.is_element_present("input[type='password']"):
+    print("⏳ 等待 Cloudflare 验证与登录表单...")
+    last_state = describe_login_page("")
+    challenge_attempts = 0
+    for second in range(60):
+        try:
+            last_state = describe_login_page(sb.get_page_source())
+        except Exception:
+            last_state = describe_login_page("")
+        if last_state["login_form"]:
             print("✅ Cloudflare 验证通过，登录表单已出现")
             break
+        if (last_state["cloudflare_challenge"]
+                and challenge_attempts < 3
+                and second in (5, 20, 35)):
+            challenge_attempts += 1
+            _try_uc_challenge(sb, challenge_attempts)
         time.sleep(1)
     else:
         print(f"❌ 60s 内未出现登录表单，当前 URL: {sb.get_current_url()}")
-        sb.save_screenshot("login_no_form.png")
+        _save_login_diagnostics(sb, "no_form", last_state)
         return None, None
 
     # 定位输入框：HidenCloud 用 name="username"（placeholder "Enter your email or username"）
@@ -352,7 +413,7 @@ def login_and_get_session(sb, email, password):
             break
     if not email_sel:
         print("❌ 未找到用户名输入框")
-        sb.save_screenshot("login_no_form.png")
+        _save_login_diagnostics(sb, "no_username", last_state)
         return None, None
 
     print("📧 填写邮箱...")
@@ -402,7 +463,7 @@ def login_and_get_session(sb, email, password):
             return cookies, csrf
 
     print(f"❌ 登录失败，页面未跳转。当前 URL: {sb.get_current_url()}")
-    sb.save_screenshot("login_failed.png")
+    _save_login_diagnostics(sb, "submit_failed", describe_login_page(sb.get_page_source()))
     return None, None
 
 
@@ -480,7 +541,7 @@ def main():
             service_ids = _extract_service_ids(html)
             if not service_ids:
                 # dashboard 可能需要再请求一次
-                client = HidenCloudClient(cookies, csrf)
+                client = HidenCloudClient(cookies, csrf, proxy_str)
                 try:
                     dash = client.get("/dashboard")
                     service_ids = _extract_service_ids(dash.text)
@@ -492,7 +553,7 @@ def main():
                 notify("ℹ️", "未发现可续期服务", "dashboard 未匹配到服务链接")
                 continue
 
-            client = HidenCloudClient(cookies, csrf)
+            client = HidenCloudClient(cookies, csrf, proxy_str)
             renew_all(client, service_ids)
             notify("✅", "续期流程已执行", f"共 {len(service_ids)} 个服务")
 

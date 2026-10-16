@@ -2,8 +2,8 @@ name: Hidencloud Auto Renew New
 
 on:
   schedule:
-    # 每 6 小时检查一次，覆盖免费服务到期前不足 1 天的续期窗口。
-    - cron: '17 */6 * * *'
+    # 每天北京时间 11:00（UTC 3:00）执行一次
+    - cron: '0 3 * * *'
   workflow_dispatch:
 
 jobs:
